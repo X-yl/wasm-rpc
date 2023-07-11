@@ -23,6 +23,8 @@ serde = "1.0"
 postcard = "1.0.4"
 async-trait = "0.1.68"
 http-body="0.4.5"
+http2parse = { version= "0.2.2", path="rust-http2parse" }
+hpack = "0.3.0"
 
 [build-dependencies]
 tonic-build = {version = "0.9", default-features = false, features=["prost"] }

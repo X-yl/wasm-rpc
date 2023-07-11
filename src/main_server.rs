@@ -29,7 +29,7 @@ impl Greeter for MyGreeter {
         println!("Got a request from {:?}", name);
 
         let reply = hello_world::HelloReply {
-            message: format!("Hello {}!", name),
+            message: format!("Hello {}", name),
         };
         Ok(Response::new(reply))
     }
@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn main_impl() -> Result<(), Box<dyn std::error::Error>> {
     let greeter = MyGreeter {};
     let greeter_server = GreeterServer::new(greeter);
-    let server = Server::new("output/greet.sock".into(), greeter_server);
+    let server = Server::new("/services/detector.sock".into(), greeter_server);
     server.serve().await?;
 
     Ok(())
