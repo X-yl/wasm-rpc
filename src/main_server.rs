@@ -14,7 +14,6 @@ pub mod hello_world {
     tonic::include_proto!("helloworld");
 }
 
-mod transfer;
 mod server;
 mod http2;
 
