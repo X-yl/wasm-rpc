@@ -14,6 +14,8 @@ use std::io::Write;
 use tonic::{body::BoxBody, server::NamedService};
 use tower::Service;
 
+use crate::http2::PREFACE;
+
 pub struct Server<S> {
     path: PathBuf,
     service: S,
@@ -22,7 +24,7 @@ pub struct Server<S> {
 fn prepare_ack_frame(identifier: u32) -> Frame<'static> {
     let ack_payload = Payload::Settings(&[]);
     let ack_header = FrameHeader {
-        length: 0,
+        length: ack_payload.encoded_len() as u32,
         kind: http2parse::Kind::Settings,
         flag: Flag::ack(),
         id: http2parse::StreamIdentifier(identifier),
@@ -92,31 +94,6 @@ fn prepare_response_bytes<'a>(data: &'_ [u8], status: u16, target: &'a mut [u8])
     &mut target[..n]
 }
 
-pub fn prepare_initial_settings() -> [Frame<'static>; 2] {
-    let payload1 = Payload::Settings(&[]);
-    let settings = Frame {
-        header: FrameHeader {
-            length: payload1.encoded_len() as u32,
-            kind: Kind::Settings,
-            flag: Flag::empty(),
-            id: http2parse::StreamIdentifier(0),
-        },
-        payload: payload1,
-    };
-
-    let payload2 = Payload::WindowUpdate(http2parse::SizeIncrement(2u32.pow(31) - 1));
-    let window_update = Frame {
-        header: FrameHeader {
-            length: payload2.encoded_len() as u32,
-            kind: Kind::WindowUpdate,
-            flag: Flag::empty(),
-            id: http2parse::StreamIdentifier(0),
-        },
-        payload: payload2,
-    };
-
-    [settings, window_update]
-}
 
 impl<S> Server<S>
 where
@@ -138,27 +115,26 @@ where
                 Ok((mut stream, _)) => {
                     let buf = &mut [0; 512];
                     let n = stream.read(buf)?;
-                    const PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+                    println!("read {:x?}", &buf[..n]);
                     assert!(&buf[..n].starts_with(PREFACE));
 
                     let mut pos = 24;
 
                     while pos < n {
                         let header = FrameHeader::parse(&buf[pos..pos + 9]).unwrap();
-                        let _frame =
+                        let frame =
                             Frame::parse(header, &buf[pos + 9..pos + 9 + header.length as usize])
                                 .unwrap();
+                        println!("{:?}", frame);
 
                         pos += 9 + header.length as usize;
                     }
 
                     let mut n = 0;
-                    for frame in prepare_initial_settings() {
+                    for frame in crate::http2::prepare_initial_settings() {
                         n += frame.encode(&mut buf[n..]);
                     }
-                    stream.write_all(&buf[..n]).unwrap();
-
-                    let n = prepare_ack_frame(0).encode(buf);
+                    n += prepare_ack_frame(0).encode(buf);
                     stream.write_all(&buf[..n]).unwrap();
                     let n = stream.read(buf)?;
 

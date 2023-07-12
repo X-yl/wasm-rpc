@@ -16,6 +16,7 @@ pub mod hello_world {
 
 mod transfer;
 mod server;
+mod http2;
 
 pub struct MyGreeter;
 

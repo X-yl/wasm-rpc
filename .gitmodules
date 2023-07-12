@@ -1,0 +1,3 @@
+[submodule "rust-http2parse"]
+	path = rust-http2parse
+	url = https://github.com/reem/rust-http2parse/

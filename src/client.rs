@@ -1,12 +1,13 @@
-use std::{future::Future, path::PathBuf, pin::Pin, task::Poll, convert::Infallible};
+use std::{convert::Infallible, future::Future, path::PathBuf, pin::Pin, task::Poll};
 
 use http::{Request, Response};
-use http_body::{Full, combinators::UnsyncBoxBody};
+use http2parse::{Flag, Frame, FrameHeader, Kind, Payload};
+use http_body::{combinators::UnsyncBoxBody, Full};
 use prost::bytes::Bytes;
 use tonic::{body::BoxBody, codegen::Body};
 use tower::Service;
 
-use crate::transfer;
+use crate::{http2::PREFACE, transfer};
 
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -36,47 +37,127 @@ impl Service<Request<BoxBody>> for Client {
     }
 }
 
+fn prepare_request_bytes<'a>(uri: &'_ [u8], data: &'_ [u8], target: &'a mut [u8]) -> &'a mut [u8] {
+    let payload1 = Payload::Settings(&[]);
+    let settings = Frame {
+        header: FrameHeader {
+            length: payload1.encoded_len() as u32,
+            kind: Kind::Settings,
+            flag: Flag::ack(),
+            id: http2parse::StreamIdentifier(0),
+        },
+        payload: payload1,
+    };
+
+    let header_bytes = hpack::Encoder::new().encode(
+        [
+            (b":path" as &[u8], uri),
+            (b":method", b"POST"),
+            (b"content-type", b"application/grpc"),
+            (b"grpc-accept-encoding", b"identity,deflate,gzip"),
+            (b"te", b"trailers"),
+            (b":scheme", b"http"),
+            (b":authority", b"localhost:1443"),
+        ]
+        .into_iter(),
+    );
+    let header_payload = Payload::Headers {
+        priority: None,
+        block: header_bytes.as_slice(),
+    };
+    let header_frame = Frame {
+        header: FrameHeader {
+            length: header_payload.encoded_len() as u32,
+            kind: Kind::Headers,
+            flag: Flag::end_headers(),
+            id: http2parse::StreamIdentifier(1),
+        },
+        payload: header_payload,
+    };
+
+    let data_payload = Payload::Data { data };
+    let data_frame = Frame {
+        header: FrameHeader {
+            length: data_payload.encoded_len() as u32,
+            kind: Kind::Data,
+            flag: Flag::empty(),
+            id: http2parse::StreamIdentifier(1),
+        },
+        payload: data_payload,
+    };
+
+    let mut n = 0;
+    n += settings.encode(&mut target[n..]);
+    n += header_frame.encode(&mut target[n..]);
+    n += data_frame.encode(&mut target[n..]);
+
+    &mut target[..n]
+}
+
 pub async fn call(
     path: PathBuf,
     request: Request<BoxBody>,
 ) -> Result<Response<UnsyncBoxBody<Bytes, Infallible>>, std::io::Error> {
     let uri = request.uri().to_string();
     let data = request.into_body().data().await.unwrap().unwrap();
-    let transfer = transfer::Request { uri, body: &data };
-    let serialized = postcard::to_vec::<transfer::Request, 512>(&transfer).unwrap();
 
     #[cfg(target_family = "wasm")]
     {
-        std::fs::write(&path, serialized.as_slice())?;
-        // FIXME: why is this 'static
-        let resp = Vec::leak(std::fs::read(&path)?);
-
-        if let Ok(resp) = postcard::from_bytes::<transfer::Response>(resp) {
-            let http_resp = http::Response::builder()
-                .status(resp.status)
-                .body(Full::new(Bytes::from_static(resp.body)).boxed_unsync()).unwrap();
-
-            return Ok(http_resp)
-        } else {
-            return Err(std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "oh no"))
+        let mut buf = [0u8; 512];
+        buf[..PREFACE.len()].copy_from_slice(PREFACE);
+        let mut n = PREFACE.len();
+        for frame in crate::http2::prepare_initial_settings() {
+            n += frame.encode(&mut buf[n..]);
         }
-    }
+        std::fs::write(&path, &buf[..n]).unwrap();
+        let resp = std::fs::read(&path)?;
 
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::net::UnixStream;
-        let mut stream = UnixStream::connect(path)?;
-        stream.write_all(serialized.as_slice())?;
-        let buf = Box::leak(Box::new([0; 512]));
-        let n = stream.read(buf)?;
-        if let Ok((resp, _)) = postcard::take_from_bytes::<transfer::Response>(&buf[..n]) {
-            println!("valid resp {:?}", resp);
-            let http_resp = http::Response::builder()
-                .status(resp.status)
-                .body(Full::new(Bytes::from_static(resp.body)).boxed_unsync()).unwrap();
+        std::fs::write(
+            &path,
+            prepare_request_bytes(&uri.as_bytes(), data.as_ref(), &mut buf),
+        )?;
 
-            return Ok(http_resp)
+        let resp = std::fs::read(&path)?;
+
+        let mut pos = 0;
+        let mut resp_data = None;
+
+        while pos < resp.len() {
+            let header = FrameHeader::parse(&resp.get(pos..pos + 9).unwrap()).unwrap();
+            let frame =
+                Frame::parse(header, &resp[pos + 9..pos + 9 + header.length as usize]).unwrap();
+
+            match frame.payload {
+                Payload::Data { data } => {
+                    resp_data.replace(data.clone());
+                }
+                Payload::Ping(i) => {
+                    let payload = Payload::Ping(i);
+                    let frame = Frame {
+                        header: FrameHeader { length: payload.encoded_len() as u32, kind: Kind::Ping, flag: Flag::ack(), id: http2parse::StreamIdentifier(1) },
+                        payload,
+                    };
+                    let mut buf2 = [0u8; 512];
+                    let n = frame.encode(&mut buf2);
+                    std::fs::write(&path, &buf2[..n]);
+                }
+                _ => {}
+            }
+
+            pos += 9 + header.length as usize;
         }
+        if let None = resp_data {
+            resp_data.replace(b"Yo it broke?");
+        }
+
+        let http_resp = http::Response::builder()
+            .status(200)
+            .body(Full::new(Bytes::copy_from_slice(resp_data.unwrap())).boxed_unsync())
+            .map_err(|e| {
+                println!("{:?}", e);
+                std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "oh no1")
+            })?;
+        
+        Ok(http_resp)
     }
 }

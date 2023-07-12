@@ -10,21 +10,23 @@ pub mod hello_world {
 
 mod client;
 mod transfer;
+mod http2;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    executor::spawn(async move { main_impl().await });
+    executor::spawn(async move { if let Err(e) = main_impl().await {
+        println!("Client err: {:?}", e);
+    }});
     executor::run(None);
     Ok(())
 }
 
 async fn main_impl() -> Result<(), Box<dyn std::error::Error>> {
     let mut avg_time_micros = 0;
-    for i in 0..10000{
+    for i in 0..1000{
         let start = SystemTime::now();
-        let mut client = GreeterClient::new(Client::new("output/greet.sock".into()));
+        let mut client = GreeterClient::new(Client::new("/services/detector.sock".into()));
         let req = tonic::Request::new(HelloRequest { name: format!("bob{}", i) });
         let resp = client.say_hello(req).await?;
-        black_box(resp);
         
         let elapsed = SystemTime::now().duration_since(start)?.as_micros();
         if avg_time_micros == 0 {
