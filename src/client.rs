@@ -139,36 +139,48 @@ pub async fn call(
         let mut pos = 0;
         let mut resp_data = None;
 
-        let resp = std::fs::read(&path)?;
+        let mut resp = std::fs::read(&path)?;
+        while let None = resp_data {
+            resp.extend(std::fs::read(&path)?);
+            while pos < resp.len() {
+                let header = FrameHeader::parse(match &resp.get(pos..pos + 9) {
+                    Some(x) => x,
+                    None => break,
+                })
+                .unwrap();
+                let frame = Frame::parse(
+                    header,
+                    match &resp.get(pos + 9..pos + 9 + header.length as usize) {
+                        Some(x) => x,
+                        None => break,
+                    },
+                )
+                .unwrap();
 
-        while pos < resp.len() {
-            let header = FrameHeader::parse(&resp.get(pos..pos + 9).unwrap()).unwrap();
-            let frame =
-                Frame::parse(header, &resp[pos + 9..pos + 9 + header.length as usize]).unwrap();
+                match frame.payload {
+                    Payload::Data { data } => {
+                        resp_data.replace(Vec::from(data));
+                    }
+                    Payload::Ping(i) => {
+                        let payload = Payload::Ping(i);
+                        let frame = Frame {
+                            header: FrameHeader {
+                                length: payload.encoded_len() as u32,
+                                kind: Kind::Ping,
+                                flag: Flag::ack(),
+                                id: http2parse::StreamIdentifier(1),
+                            },
+                            payload,
+                        };
+                        let mut buf2 = [0u8; 512];
+                        let n = frame.encode(&mut buf2);
+                        std::fs::write(&path, &buf2[..n]);
+                    }
+                    _ => {}
+                }
 
-            match frame.payload {
-                Payload::Data { data } => {
-                    resp_data.replace(Vec::from(data));
-                }
-                Payload::Ping(i) => {
-                    let payload = Payload::Ping(i);
-                    let frame = Frame {
-                        header: FrameHeader {
-                            length: payload.encoded_len() as u32,
-                            kind: Kind::Ping,
-                            flag: Flag::ack(),
-                            id: http2parse::StreamIdentifier(1),
-                        },
-                        payload,
-                    };
-                    let mut buf2 = [0u8; 512];
-                    let n = frame.encode(&mut buf2);
-                    std::fs::write(&path, &buf2[..n]);
-                }
-                _ => {}
+                pos += 9 + header.length as usize;
             }
-
-            pos += 9 + header.length as usize;
         }
 
         let http_resp = http::Response::builder()

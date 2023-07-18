@@ -1,1 +1,1 @@
-./freestanding-execution-engine -e -d --input-source $1 --pipeline $1 --input-source 'output' --execution-strategy jit --enable-clock
+RUST_LOG=execution_engine=info ./freestanding-execution-engine -e -d --input-source $1 --pipeline $1 --input-source '/services' --output-source '/services' --execution-strategy jit --enable-clock
