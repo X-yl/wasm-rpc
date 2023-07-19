@@ -3,16 +3,20 @@ use std::{
     future::Future,
     path::PathBuf,
     pin::Pin,
-    sync::atomic::{AtomicBool, AtomicU32},
+    sync::{
+        atomic::{AtomicBool, AtomicU32},
+        mpsc,
+    },
     task::Poll,
 };
 
 use http::{Request, Response};
 use http2parse::{Flag, Frame, FrameHeader, Kind, Payload};
 use http_body::{combinators::UnsyncBoxBody, Full};
-use prost::bytes::Bytes;
+use prost::bytes::{Bytes, BytesMut};
 use tonic::{body::BoxBody, codegen::Body};
 use tower::Service;
+use wasm_rs_async_executor::single_threaded as executor;
 
 use crate::http2::PREFACE;
 
@@ -137,60 +141,94 @@ pub async fn call(
         )?;
 
         let mut pos = 0;
-        let mut resp_data = None;
 
-        let mut resp = std::fs::read(&path)?;
-        while let None = resp_data {
-            resp.extend(std::fs::read(&path)?);
-            while pos < resp.len() {
-                let header = FrameHeader::parse(match &resp.get(pos..pos + 9) {
-                    Some(x) => x,
-                    None => break,
-                })
-                .unwrap();
-                let frame = Frame::parse(
-                    header,
-                    match &resp.get(pos + 9..pos + 9 + header.length as usize) {
-                        Some(x) => x,
-                        None => break,
-                    },
-                )
-                .unwrap();
-
-                match frame.payload {
-                    Payload::Data { data } => {
-                        resp_data.replace(Vec::from(data));
-                    }
-                    Payload::Ping(i) => {
-                        let payload = Payload::Ping(i);
-                        let frame = Frame {
-                            header: FrameHeader {
-                                length: payload.encoded_len() as u32,
-                                kind: Kind::Ping,
-                                flag: Flag::ack(),
-                                id: http2parse::StreamIdentifier(1),
-                            },
-                            payload,
-                        };
-                        let mut buf2 = [0u8; 512];
-                        let n = frame.encode(&mut buf2);
-                        std::fs::write(&path, &buf2[..n]);
-                    }
-                    _ => {}
-                }
-
-                pos += 9 + header.length as usize;
-            }
-        }
-
+        let (tx, rx) = mpsc::channel();
         let http_resp = http::Response::builder()
             .status(200)
-            .body(Full::new(Bytes::copy_from_slice(resp_data.unwrap().as_slice())).boxed_unsync())
+            .body(StreamingBody { rx }.boxed_unsync())
             .map_err(|e| {
                 println!("{:?}", e);
                 std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "oh no1")
             })?;
 
+        executor::spawn(async move {
+            let mut resp = std::fs::read(&path).unwrap();
+            'outer: loop {
+                resp.extend(std::fs::read(&path).unwrap());
+                while pos < resp.len() {
+                    let header = FrameHeader::parse(match &resp.get(pos..pos + 9) {
+                        Some(x) => x,
+                        None => break,
+                    })
+                    .unwrap();
+                    let frame = Frame::parse(
+                        header,
+                        match &resp.get(pos + 9..pos + 9 + header.length as usize) {
+                            Some(x) => x,
+                            None => break,
+                        },
+                    )
+                    .unwrap();
+
+                    match frame.payload {
+                        Payload::Data { data } => {
+                            tx.send(Bytes::copy_from_slice(data)).unwrap();
+                        }
+                        Payload::Headers { .. } => {
+                            if frame.header.flag.contains(Flag::end_stream()) {
+                                break 'outer;
+                            }
+                        }
+                        Payload::Ping(i) => {
+                            let payload = Payload::Ping(i);
+                            let frame = Frame {
+                                header: FrameHeader {
+                                    length: payload.encoded_len() as u32,
+                                    kind: Kind::Ping,
+                                    flag: Flag::ack(),
+                                    id: http2parse::StreamIdentifier(1),
+                                },
+                                payload,
+                            };
+                            let mut buf2 = [0u8; 512];
+                            let n = frame.encode(&mut buf2);
+                            std::fs::write(&path, &buf2[..n]);
+                        }
+                        _ => {}
+                    }
+
+                    pos += 9 + header.length as usize;
+                }
+            }
+        });
         Ok(http_resp)
+    }
+}
+
+struct StreamingBody {
+    rx: mpsc::Receiver<Bytes>,
+}
+
+impl Body for StreamingBody {
+    type Data = Bytes;
+
+    type Error = Infallible;
+
+    fn poll_data(
+        self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
+        match self.rx.try_recv() {
+            Ok(x) => Poll::Ready(Some(Ok(x))),
+            Err(mpsc::TryRecvError::Empty) => Poll::Pending,
+            Err(mpsc::TryRecvError::Disconnected) => Poll::Ready(None),
+        }
+    }
+
+    fn poll_trailers(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<Option<http::HeaderMap>, Self::Error>> {
+        Poll::Ready(Ok(None))
     }
 }

@@ -164,18 +164,19 @@ where
                 )
                 .await
                 .unwrap();
-            // let settings = crate::http2::prepare_initial_settings();
-            // for s in settings {
-            //     tx.send(
-            //         OwnedFrameBuilder {
-            //             buf: Box::new([]),
-            //             frame_builder: |_| s,
-            //         }
-            //         .build(),
-            //     )
-            //     .await
-            //     .unwrap();
-            // }
+            let settings = crate::http2::prepare_initial_settings();
+            for s in settings {
+                tx_frame
+                    .send(
+                        OwnedFrameBuilder {
+                            buf: Box::new([]),
+                            frame_builder: |_| s,
+                        }
+                        .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
         }
         let mut headers = None;
 
@@ -211,7 +212,7 @@ where
                         .unwrap();
 
                     while let Some(Ok(chunk)) = body.data().await {
-                        println!("{:?}", String::from_utf8_lossy(&chunk));
+                        println!("resp: {:?}", String::from_utf8_lossy(&chunk));
                         tx_frame
                             .send(prepare_response(stream_id, chunk.as_ref()))
                             .await
@@ -222,6 +223,26 @@ where
                         .send(prepare_response_trailers(stream_id))
                         .await
                         .unwrap();
+                }
+                Payload::Ping(x) => {
+                    let payload = Payload::Ping(x);
+                    let frame = Frame {
+                        header: FrameHeader {
+                            length: payload.encoded_len() as u32,
+                            kind: Kind::Ping,
+                            flag: Flag::empty(),
+                            id: stream_id,
+                        },
+                        payload,
+                    };
+
+                    tx_frame.send(
+                        OwnedFrameBuilder {
+                            buf: Box::new([]),
+                            frame_builder: |_| frame,
+                        }
+                        .build(),
+                    ).await.unwrap();
                 }
                 _ => {
                     println!("ignored frame {:?}", frame.payload);
