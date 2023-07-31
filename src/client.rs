@@ -1,5 +1,4 @@
 use std::{
-    convert::Infallible,
     future::Future,
     path::PathBuf,
     pin::Pin,
@@ -10,10 +9,11 @@ use std::{
     task::Poll,
 };
 
+use anyhow::Result;
 use http::{Request, Response};
 use http2parse::{Flag, Frame, FrameHeader, Kind, Payload};
-use http_body::{combinators::UnsyncBoxBody, Full};
-use prost::bytes::{Bytes, BytesMut};
+use http_body::combinators::UnsyncBoxBody;
+use prost::bytes::Bytes;
 use tonic::{body::BoxBody, codegen::Body};
 use tower::Service;
 use wasm_rs_async_executor::single_threaded as executor;
@@ -35,8 +35,8 @@ impl Client {
 }
 
 impl Service<Request<BoxBody>> for Client {
-    type Response = Response<UnsyncBoxBody<Bytes, Infallible>>;
-    type Error = std::io::Error;
+    type Response = Response<UnsyncBoxBody<Bytes, anyhow::Error>>;
+    type Error = anyhow::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
 
     fn poll_ready(
@@ -115,9 +115,13 @@ fn prepare_request_bytes<'a>(uri: &'_ [u8], data: &'_ [u8], target: &'a mut [u8]
 pub async fn call(
     path: PathBuf,
     request: Request<BoxBody>,
-) -> Result<Response<UnsyncBoxBody<Bytes, Infallible>>, std::io::Error> {
+) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>> {
     let uri = request.uri().to_string();
-    let data = request.into_body().data().await.unwrap().unwrap();
+    let data = request
+        .into_body()
+        .data()
+        .await
+        .ok_or(anyhow::anyhow!("No available data."))??;
 
     #[cfg(target_family = "wasm")]
     {
@@ -129,10 +133,8 @@ pub async fn call(
                 n += frame.encode(&mut buf[n..]);
             }
             while let Err(_) = std::fs::write(&path, &buf[..n]) {
-                print!(".");
                 continue;
             }
-            let resp = std::fs::read(&path)?;
         }
 
         std::fs::write(
@@ -145,60 +147,63 @@ pub async fn call(
         let (tx, rx) = mpsc::channel();
         let http_resp = http::Response::builder()
             .status(200)
-            .body(StreamingBody { rx }.boxed_unsync())
-            .map_err(|e| {
-                println!("{:?}", e);
-                std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "oh no1")
-            })?;
+            .body(StreamingBody { rx }.boxed_unsync())?;
 
         executor::spawn(async move {
-            let mut resp = std::fs::read(&path).unwrap();
-            'outer: loop {
-                resp.extend(std::fs::read(&path).unwrap());
-                while pos < resp.len() {
-                    let header = FrameHeader::parse(match &resp.get(pos..pos + 9) {
-                        Some(x) => x,
-                        None => break,
-                    })
-                    .unwrap();
-                    let frame = Frame::parse(
-                        header,
-                        match &resp.get(pos + 9..pos + 9 + header.length as usize) {
+            let exec = async {
+                let mut resp = std::fs::read(&path)?;
+                'outer: loop {
+                    resp.extend(std::fs::read(&path)?);
+                    while pos < resp.len() {
+                        let header = FrameHeader::parse(match &resp.get(pos..pos + 9) {
                             Some(x) => x,
                             None => break,
-                        },
-                    )
-                    .unwrap();
+                        })?;
 
-                    match frame.payload {
-                        Payload::Data { data } => {
-                            tx.send(Bytes::copy_from_slice(data)).unwrap();
-                        }
-                        Payload::Headers { .. } => {
-                            if frame.header.flag.contains(Flag::end_stream()) {
-                                break 'outer;
+                        let frame = Frame::parse(
+                            header,
+                            match &resp.get(pos + 9..pos + 9 + header.length as usize) {
+                                Some(x) => x,
+                                None => break,
+                            },
+                        )?;
+
+                        match frame.payload {
+                            Payload::Data { data } => {
+                                if let Err(_) = tx.send(Ok(Bytes::copy_from_slice(data))) {
+                                    break;
+                                }
                             }
+                            Payload::Headers { .. } => {
+                                if frame.header.flag.contains(Flag::end_stream()) {
+                                    break 'outer Ok::<(), anyhow::Error>(());
+                                }
+                            }
+                            Payload::Ping(i) => {
+                                let payload = Payload::Ping(i);
+                                let frame = Frame {
+                                    header: FrameHeader {
+                                        length: payload.encoded_len() as u32,
+                                        kind: Kind::Ping,
+                                        flag: Flag::ack(),
+                                        id: http2parse::StreamIdentifier(1),
+                                    },
+                                    payload,
+                                };
+                                let mut buf2 = [0u8; 512];
+                                let n = frame.encode(&mut buf2);
+                                std::fs::write(&path, &buf2[..n])?;
+                            }
+                            _ => {}
                         }
-                        Payload::Ping(i) => {
-                            let payload = Payload::Ping(i);
-                            let frame = Frame {
-                                header: FrameHeader {
-                                    length: payload.encoded_len() as u32,
-                                    kind: Kind::Ping,
-                                    flag: Flag::ack(),
-                                    id: http2parse::StreamIdentifier(1),
-                                },
-                                payload,
-                            };
-                            let mut buf2 = [0u8; 512];
-                            let n = frame.encode(&mut buf2);
-                            std::fs::write(&path, &buf2[..n]);
-                        }
-                        _ => {}
-                    }
 
-                    pos += 9 + header.length as usize;
+                        pos += 9 + header.length as usize;
+                    }
+                    YieldNow { yielded: false }.await
                 }
+            };
+            if let Err(e) = exec.await {
+                let _ = tx.send(Err(e));
             }
         });
         Ok(http_resp)
@@ -206,20 +211,37 @@ pub async fn call(
 }
 
 struct StreamingBody {
-    rx: mpsc::Receiver<Bytes>,
+    rx: mpsc::Receiver<Result<Bytes>>,
+}
+
+struct YieldNow {
+    yielded: bool,
+}
+
+impl Future for YieldNow {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        if !self.yielded {
+            self.as_mut().yielded = true;
+            return Poll::Pending;
+        } else {
+            return Poll::Ready(());
+        }
+    }
 }
 
 impl Body for StreamingBody {
     type Data = Bytes;
 
-    type Error = Infallible;
+    type Error = anyhow::Error;
 
     fn poll_data(
         self: Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
         match self.rx.try_recv() {
-            Ok(x) => Poll::Ready(Some(Ok(x))),
+            Ok(x) => Poll::Ready(Some(x)),
             Err(mpsc::TryRecvError::Empty) => Poll::Pending,
             Err(mpsc::TryRecvError::Disconnected) => Poll::Ready(None),
         }
@@ -227,7 +249,7 @@ impl Body for StreamingBody {
 
     fn poll_trailers(
         self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<Option<http::HeaderMap>, Self::Error>> {
         Poll::Ready(Ok(None))
     }

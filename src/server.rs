@@ -53,8 +53,6 @@ fn prepare_response_header(stream_id: StreamIdentifier, status: u16) -> OwnedFra
             ]
             .into_iter(),
         );
-    // hpack::Encoder::new().encode([(b"grpc-status" as &[u8], b"0" as &[u8])].into_iter()),
-    // ];
 
     return OwnedFrameBuilder {
         buf: bytes.into_boxed_slice(),
@@ -236,13 +234,16 @@ where
                         payload,
                     };
 
-                    tx_frame.send(
-                        OwnedFrameBuilder {
-                            buf: Box::new([]),
-                            frame_builder: |_| frame,
-                        }
-                        .build(),
-                    ).await.unwrap();
+                    tx_frame
+                        .send(
+                            OwnedFrameBuilder {
+                                buf: Box::new([]),
+                                frame_builder: |_| frame,
+                            }
+                            .build(),
+                        )
+                        .await
+                        .unwrap();
                 }
                 _ => {
                     println!("ignored frame {:?}", frame.payload);

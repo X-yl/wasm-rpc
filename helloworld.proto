@@ -2,13 +2,15 @@ syntax = "proto3";
 package helloworld;
 
 service Greeter {
-    rpc SayHello (HelloRequest) returns (stream HelloReply);
+    rpc ProcessVideo (ProcessRequest) returns (stream FrameStatus) {};
 }
 
-message HelloRequest {
-   string name = 1;
+message ProcessRequest {
+   string path = 1;
 }
 
-message HelloReply {
-    string message = 1;
+message FrameStatus {
+    int32 frame_count = 1;
+    repeated string names = 2;
+    repeated float probabilities = 3;
 }
