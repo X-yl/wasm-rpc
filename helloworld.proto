@@ -1,16 +1,15 @@
 syntax = "proto3";
 package helloworld;
 
-service Greeter {
-    rpc ProcessVideo (ProcessRequest) returns (stream FrameStatus) {};
+service Benchmark {
+    rpc LatencyEcho (Message) returns (Message) {};
+    rpc ThroughputTest (ThroughputRequest) returns (stream Message) {};
 }
 
-message ProcessRequest {
-   string path = 1;
+message Message {
+   string bytes = 1;
 }
 
-message FrameStatus {
-    int32 frame_count = 1;
-    repeated string names = 2;
-    repeated float probabilities = 3;
+message ThroughputRequest {
+    uint32 buffer_size = 1;    
 }

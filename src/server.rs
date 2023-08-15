@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use http2parse::StreamIdentifier;
 use http_body::combinators::UnsyncBoxBody;
 use std::collections::HashMap;
@@ -44,7 +45,7 @@ fn prepare_ack_frame(identifier: u32) -> Frame<'static> {
 }
 
 fn prepare_response_header(stream_id: StreamIdentifier, status: u16) -> OwnedFrame {
-    let bytes = //[
+    let bytes = 
         hpack::Encoder::new().encode(
             [
                 (b":status" as &[u8], format!("{}", status).as_bytes()),
@@ -210,7 +211,6 @@ where
                         .unwrap();
 
                     while let Some(Ok(chunk)) = body.data().await {
-                        println!("resp: {:?}", String::from_utf8_lossy(&chunk));
                         tx_frame
                             .send(prepare_response(stream_id, chunk.as_ref()))
                             .await
@@ -245,9 +245,7 @@ where
                         .await
                         .unwrap();
                 }
-                _ => {
-                    println!("ignored frame {:?}", frame.payload);
-                }
+                _ => {}
             }
         }
     }
@@ -276,47 +274,67 @@ where
                     tokio::spawn(async move {
                         let mut tasks = Vec::new();
                         let (tx_to_self, mut self_rx) = mpsc::channel(32);
-                        let (read_stream, mut write_stream) = stream.into_split();
+                        let (mut read_stream, mut write_stream) = stream.into_split();
                         tasks.push(tokio::spawn(async move {
                             loop {
                                 let resp: OwnedFrame = self_rx.recv().await.unwrap();
-                                let mut buf = [0u8; 512];
+                                let mut buf = vec![0; resp.borrow_frame().encoded_len()];
                                 let n = resp.borrow_frame().encode(&mut buf);
                                 write_stream.write_all(&buf[..n]).await.unwrap();
                             }
                         }));
                         let mut streams = HashMap::new();
                         loop {
-                            let mut buf = [0; 512];
+                            // FIXME: grow this vec as necessary.
+                            let mut buf = vec![0; 512];
                             read_stream.readable().await.unwrap();
-                            let n = match read_stream.try_read(&mut buf) {
+                            let mut n = match read_stream.try_read(&mut buf[..512]) {
                                 Ok(x) => x,
                                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                     continue
                                 }
                                 Err(e) => {
-                                    println!("done");
+                                    eprintln!("{:?}", e);
                                     return Err::<(), Box<dyn Error + Send>>(Box::new(e));
                                 }
                             };
-                            // println!("{:?}", n);
                             if n == 0 {
                                 break;
                             }
                             let mut frames = Vec::new();
                             let mut pos = if buf[..n].starts_with(PREFACE) { 24 } else { 0 };
                             while pos < n {
-                                let header = FrameHeader::parse(&buf[pos..pos + 9]).unwrap();
-                                let owned_frame = OwnedFrameBuilder {
-                                    buf: Vec::from(&buf[pos + 9..pos + 9 + header.length as usize])
-                                        .into_boxed_slice(),
-                                    frame_builder: |buf| {
-                                        Frame::parse(header, buf.as_ref()).unwrap()
-                                    },
+                                const HEADER_SIZE: usize = 9;
+                                read_min_bytes(
+                                    &mut buf,
+                                    n,
+                                    pos + HEADER_SIZE,
+                                    &mut read_stream,
+                                ).await?;
+                                n = std::cmp::max(pos + HEADER_SIZE, n);
+                                let header = FrameHeader::parse(&buf[pos..pos + HEADER_SIZE])
+                                    .map_err(|x| anyhow!(x))?;
+
+                                read_min_bytes(
+                                    &mut buf,
+                                    n,
+                                    pos + header.length as usize + HEADER_SIZE,
+                                    &mut read_stream,
+                                ).await.unwrap();
+                                n = std::cmp::max(n, pos + header.length as usize + HEADER_SIZE);
+
+                                let owned_frame = OwnedFrameTryBuilder {
+                                    buf: Vec::from(
+                                        &buf[pos + HEADER_SIZE
+                                            ..pos + HEADER_SIZE + header.length as usize],
+                                    )
+                                    .into_boxed_slice(),
+                                    frame_builder: |buf| Frame::parse(header, buf.as_ref()),
                                 }
-                                .build();
+                                .try_build()
+                                .map_err(|x| anyhow!(x)).unwrap();
                                 frames.push(owned_frame);
-                                pos += 9 + header.length as usize;
+                                pos += HEADER_SIZE + header.length as usize;
                             }
                             for frame in frames {
                                 let stream_id = frame.borrow_frame().header.id.0;
@@ -349,6 +367,34 @@ where
             }
         }
     }
+}
+
+async fn read_min_bytes(
+    buf: &mut Vec<u8>,
+    mut start: usize,
+    min_bytes: usize,
+    read_stream: &mut tokio::net::unix::OwnedReadHalf,
+) -> Result<(), Box<dyn Error + Send>> {
+    if min_bytes <= start {
+        // Already enough bytes in the buffer
+        return Ok(())
+    }
+    buf.resize(min_bytes, 0);
+    while start < min_bytes {
+        read_stream.readable().await.unwrap();
+        let n = match read_stream.try_read(&mut buf[start..min_bytes]) {
+            Ok(x) => x,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => {
+                return Err(Box::new(e));
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        start += n;
+    }
+    Ok(())
 }
 
 pub struct ReceiverStream<T> {
