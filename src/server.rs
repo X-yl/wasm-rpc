@@ -3,9 +3,11 @@ use http2parse::StreamIdentifier;
 use http_body::combinators::UnsyncBoxBody;
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::mpsc::TryRecvError;
 use std::task::{Context, Poll};
 use std::{convert::Infallible, error::Error, path::PathBuf};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::oneshot;
 use tonic::Status;
@@ -45,15 +47,14 @@ fn prepare_ack_frame(identifier: u32) -> Frame<'static> {
 }
 
 fn prepare_response_header(stream_id: StreamIdentifier, status: u16) -> OwnedFrame {
-    let bytes = 
-        hpack::Encoder::new().encode(
-            [
-                (b":status" as &[u8], format!("{}", status).as_bytes()),
-                (b"content-type", b"application/grpc"),
-                (b"grpc-accept-encoding", b"identity,deflate,gzip"),
-            ]
-            .into_iter(),
-        );
+    let bytes = hpack::Encoder::new().encode(
+        [
+            (b":status" as &[u8], format!("{}", status).as_bytes()),
+            (b"content-type", b"application/grpc"),
+            (b"grpc-accept-encoding", b"identity,deflate,gzip"),
+        ]
+        .into_iter(),
+    );
 
     return OwnedFrameBuilder {
         buf: bytes.into_boxed_slice(),
@@ -195,6 +196,7 @@ where
                         .unwrap()
                         .1;
 
+                    // FIXME: should _not_ be Full.
                     let http_req = http::Request::options(uri.as_slice())
                         .body(Full::new(Bytes::copy_from_slice(data)))
                         .unwrap();
@@ -305,12 +307,8 @@ where
                             let mut pos = if buf[..n].starts_with(PREFACE) { 24 } else { 0 };
                             while pos < n {
                                 const HEADER_SIZE: usize = 9;
-                                read_min_bytes(
-                                    &mut buf,
-                                    n,
-                                    pos + HEADER_SIZE,
-                                    &mut read_stream,
-                                ).await?;
+                                read_min_bytes(&mut buf, n, pos + HEADER_SIZE, &mut read_stream)
+                                    .await?;
                                 n = std::cmp::max(pos + HEADER_SIZE, n);
                                 let header = FrameHeader::parse(&buf[pos..pos + HEADER_SIZE])
                                     .map_err(|x| anyhow!(x))?;
@@ -320,7 +318,9 @@ where
                                     n,
                                     pos + header.length as usize + HEADER_SIZE,
                                     &mut read_stream,
-                                ).await.unwrap();
+                                )
+                                .await
+                                .unwrap();
                                 n = std::cmp::max(n, pos + header.length as usize + HEADER_SIZE);
 
                                 let owned_frame = OwnedFrameTryBuilder {
@@ -332,7 +332,8 @@ where
                                     frame_builder: |buf| Frame::parse(header, buf.as_ref()),
                                 }
                                 .try_build()
-                                .map_err(|x| anyhow!(x)).unwrap();
+                                .map_err(|x| anyhow!(x))
+                                .unwrap();
                                 frames.push(owned_frame);
                                 pos += HEADER_SIZE + header.length as usize;
                             }
@@ -377,7 +378,7 @@ async fn read_min_bytes(
 ) -> Result<(), Box<dyn Error + Send>> {
     if min_bytes <= start {
         // Already enough bytes in the buffer
-        return Ok(())
+        return Ok(());
     }
     buf.resize(min_bytes, 0);
     while start < min_bytes {

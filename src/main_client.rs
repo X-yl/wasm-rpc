@@ -1,9 +1,16 @@
+use std::borrow::BorrowMut;
+use std::fmt::format;
 use std::hint::black_box;
+use std::pin::Pin;
+use std::sync::mpsc;
+use std::task::{Context, Poll};
 use std::time::SystemTime;
 
-use crate::hello_world::benchmark_client::BenchmarkClient;
-use crate::hello_world::{Message, ThroughputRequest};
 use client::Client;
+use hello_world::ProcessRequest;
+use hello_world::greeter_client::GreeterClient;
+use tonic::Request;
+use tonic::codegen::futures_core::Stream;
 use wasm_rs_async_executor::single_threaded as executor;
 
 #[allow(non_snake_case)]
@@ -17,7 +24,7 @@ mod http2;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     executor::spawn(async move {
         if let Err(e) = main_impl().await {
-            println!("Client err: {:?}", e);
+            println!("2Client err: {:?}", e);
         }
     });
     executor::run(None);
@@ -25,48 +32,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn main_impl() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting..");
-    std::fs::write("/services/server.special", "pls start :)")?;
-    // let mut client = BenchmarkClient::new(Client::new("/services/server.sock".into()));
-    // for size in [1usize, 16, 32, 64]
-    //     .into_iter()
-    //     .chain(
-    //         (1..)
-    //             .map(|x| (((x as f64).powf(1.5)) * 100.0) as usize)
-    //             .take_while(|&x| x <= 100_000),
-    //     )
-    //     .skip_while(|&x| x < 36421)
-    // {
-    //     let mut bytes = Vec::new();
-    //     bytes.resize(size, 'A' as u8);
-    //     let msg = Message {
-    //         bytes: String::from_utf8(bytes).unwrap(),
-    //     };
-    //     for _ in 0..5_000 {
-    //         let req = tonic::Request::new(msg.clone());
-    //         client.latency_echo(req).await?;
-    //     }
-    //     let start = SystemTime::now();
-    //     for _ in 0..200_000 {
-    //         let req = tonic::Request::new(msg.clone());
-    //         client.latency_echo(req).await?;
-    //     }
-    //     let elapsed = start.elapsed().unwrap();
-    //     println!("{},{}", size, elapsed.as_micros() / 200_000);
-    // }
-    let mut client = BenchmarkClient::new(Client::new("/services/server.sock".into()));
-    for buffer_size in [32678]
-    {
-        let msg = ThroughputRequest { buffer_size };
-        let req = tonic::Request::new(msg.clone());
-        let start = SystemTime::now();
-        let mut resp = client.throughput_test(req).await?.into_inner();
-        while let Some(_) = resp.message().await? {
-        }
-        let elapsed = start.elapsed().unwrap();
+    std::fs::write("/services/detector.special", "pls start :)").unwrap();
+    let mut client = GreeterClient::new(Client::new("/services/detector.sock".into()));
 
-        println!("{},{}", buffer_size, elapsed.as_micros());
+    let message = ProcessRequest {
+        path: "/video_input/in.h264".to_string()
+    };
+
+    println!("Processing video");
+    let mut resp = client.process_video(Request::new(message)).await.unwrap().into_inner();
+
+    while let Some(status) = resp.message().await.unwrap() {
+        println!("frame-status|{}|{:?}",status.frame_count, status.items.iter().map(|it| {
+            format!("{},{},{},{},{},{}", it.object, it.probability, it.x, it.y, it.w, it.h)
+        }).collect::<Vec<_>>())        
     }
 
+
     Ok(())
+}
+
+pub struct IterStream<T, It>
+where
+    It: Iterator<Item = T>,
+{
+    inner: It,
+}
+
+impl<T, It> IterStream<T, It>
+where
+    It: Iterator<Item = T>,
+{
+    /// Create a new `ReceiverStream`.
+    pub fn new(recv: It) -> Self {
+        Self { inner: recv }
+    }
+}
+impl<T, It> Unpin for IterStream<T, It> where It: Iterator<Item = T> {}
+
+impl<T, It> Stream for IterStream<T, It>
+where
+    It: Iterator<Item = T>,
+{
+    type Item = T;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(self.inner.next())
+    }
 }

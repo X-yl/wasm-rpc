@@ -1,3 +1,5 @@
+use std::sync::atomic::AtomicBool;
+
 use crate::hello_world::benchmark_client::BenchmarkClient;
 use crate::hello_world::Message;
 use async_trait::async_trait;
@@ -7,8 +9,10 @@ use hello_world::{
 };
 use server::ReceiverStream;
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::broadcast;
 use tonic::{Request, Response, Status};
 
+use crate::server::BroadcastReceiverStream;
 use crate::server::Server;
 
 #[allow(non_snake_case)]
@@ -18,7 +22,11 @@ pub mod hello_world {
 mod http2;
 mod server;
 
-pub struct Bencher;
+pub struct Bencher {
+    tx: Option<broadcast::Sender<Result<Message, Status>>>,
+    rx: Option<broadcast::Receiver<Result<Message, Status>>>,
+    got_subscriber: &'static AtomicBool
+}
 
 #[async_trait]
 impl Benchmark for Bencher {
@@ -30,6 +38,7 @@ impl Benchmark for Bencher {
     }
 
     type ThroughputTestStream = ReceiverStream<Result<Message, Status>>;
+    type MultiClientThroughputRxStream = ReceiverStream<Result<Message, Status>>;
 
     async fn throughput_test(
         &self,
@@ -48,14 +57,62 @@ impl Benchmark for Bencher {
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
+
+    async fn multi_client_throughput_rx(
+        &self,
+        request: tonic::Request<ThroughputRequest>,
+    ) -> Result<Response<Self::MultiClientThroughputRxStream>, Status> {
+        println!("got a subscriber!");
+        let mut rx_clone = self.rx.as_ref().unwrap().resubscribe();
+        let (tx2, rx2) = mpsc::channel(64);
+        tokio::spawn(async move {
+            loop {
+                tx2.send(rx_clone.recv().await.unwrap()).await.unwrap();
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx2)))
+    }
+
+    async fn multi_client_throughput_tx(
+        &self,
+        request: Request<tonic::Streaming<Message>> 
+    ) -> Result<Response<Message>, Status> {
+        let tx_clone = self.tx.clone().unwrap();
+        tokio::spawn(async move {
+            let mut stream = request.into_inner();
+            while let Some(msg) = stream.message().await.unwrap() {
+                tx_clone.send(Ok(msg)).unwrap();
+            }
+        });
+        Ok(Response::new(Message { bytes: "ok".to_string() }))
+    }
+
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let bencher = Bencher {};
+    let (tx, rx) = broadcast::channel(32);
+    let got_subscriber = Box::leak(Box::new(false.into()));
+    let bencher = Bencher {
+        tx: Some(tx),
+        rx: None,
+        got_subscriber
+    };
+
+    let bencher2 = Bencher {
+        tx: None,
+        rx: Some(rx),
+        got_subscriber
+    };
+
     let bencher_server = BenchmarkServer::new(bencher);
     let server = Server::new("/services/server.sock".into(), bencher_server);
-    server.serve().await?;
+    println!("Serving on server.sock");
+
+    let bencher_server2 = BenchmarkServer::new(bencher2);
+    let server2 = Server::new("/services/server2.sock".into(), bencher_server2);
+    println!("Serving on server2.sock");
+    tokio::try_join!(server.serve(), server2.serve())?;
 
     Ok(())
 }
