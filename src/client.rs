@@ -40,7 +40,7 @@ impl Client {
     pub fn new(path: PathBuf) -> Self {
         Client {
             path,
-            stream_id: Arc::new(0.into()),
+            stream_id: Arc::new(1.into()),
             connection_initalized: Arc::new(false.into()),
         }
     }
